@@ -47,15 +47,15 @@
     <!-- Publisher related workflows -->
     <!--APIStateChange executor="org.wso2.carbon.apimgt.impl.workflow.APIStateChangeSimpleWorkflowExecutor" /-->
 
-<APIStateChange executor="com.example.wso2.PromoteWorkflowExecutor" >
-           <Property name="githubToken">token_value</Property>
-           <Property name="githubOwner">owner_value</Property>
-           <Property name="githubRepo">repo_value</Property>
-           <Property name="workflowFileName">workflow_value</Property>
-  </APIStateChange>
+    <APIStateChange executor="com.example.wso2.PromoteWorkflowExecutor" >
+           <Property name="serviceNowBaseUrl">https://dev353363.service-now.com</Property>
+           <Property name="serviceNowUserName">admin</Property>
+           <Property name="serviceNowPassword">=ccHQ59^KJnl</Property>
+           <Property name="stateList">Created:Publish,Prototyped:Publish</Property>
+    </APIStateChange>
 
     <!--APIStateChange executor="org.wso2.carbon.apimgt.impl.workflow.APIStateChangeApprovalWorkflowExecutor">
-        <Property name="stateList">Created:Publish,Published:Block</Property>
+        <Property name="stateList">Created:Publish,Prototyped:Published:Block</Property>
     </APIStateChange-->
 
     <APIProductStateChange executor="org.wso2.carbon.apimgt.impl.workflow.APIProductStateChangeSimpleWorkflowExecutor" />

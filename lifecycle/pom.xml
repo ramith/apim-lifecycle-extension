@@ -52,12 +52,12 @@
     		<dependency>
 			  <groupId>org.wso2.carbon.apimgt</groupId>
 			  <artifactId>org.wso2.carbon.apimgt.api</artifactId>
-			  <version>9.29.119</version>
+			  <version>9.32.147</version>
 		</dependency>
 		<dependency>
 			<groupId>org.wso2.carbon.apimgt</groupId>
 			<artifactId>org.wso2.carbon.apimgt.impl</artifactId>
-			<version>9.29.119</version>
+			<version>9.32.147</version>
 		</dependency>
   </dependencies>
 
