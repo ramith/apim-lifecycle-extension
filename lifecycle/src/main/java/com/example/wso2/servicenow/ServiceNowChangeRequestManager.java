@@ -62,9 +62,10 @@ public class ServiceNowChangeRequestManager {
      * @param apiVersion API version
      * @param apiTag Tag for API name (e.g., "api:PetStore")
      * @param versionTag Tag for version (e.g., "version:1.0.0")
+     * @return sys_id of the created change request
      * @throws Exception if creation fails
      */
-    public void createChangeRequestWithTags(String apiName, String apiVersion, String apiTag, String versionTag)
+    public String createChangeRequestWithTags(String apiName, String apiVersion, String apiTag, String versionTag)
             throws Exception {
 
         log.error("[createChangeRequestWithTags] Creating change request for API: " + apiName + " v" + apiVersion);
@@ -86,6 +87,7 @@ public class ServiceNowChangeRequestManager {
         }
         
         log.error("[createChangeRequestWithTags] All tags attached - tags should now be visible in ServiceNow UI");
+        return changeSysId;
     }
 
     /**
@@ -298,6 +300,136 @@ public class ServiceNowChangeRequestManager {
             String errorMsg = "[addUnauthorizedAttemptComment] Failed to add comment to CR: " + changeRequestNumber;
             log.error(errorMsg, e);
             // Don't throw exception - comment failure shouldn't break workflow
+        }
+    }
+
+    /**
+     * Gets the sys_id for a change request by searching with API tags.
+     * 
+     * @param apiTag API tag
+     * @param versionTag Version tag
+     * @return sys_id or null if not found
+     * @throws Exception if search fails
+     */
+    public String getChangeRequestSysId(String apiTag, String versionTag) throws Exception {
+        log.error("[getChangeRequestSysId] Searching for change request sys_id with tags: [" + apiTag + ", " + versionTag + "]");
+
+        // Find the sys_id for both tags
+        String apiTagSysId = tagManager.findTagByName(apiTag);
+        if (apiTagSysId == null) {
+            log.error("[getChangeRequestSysId] API tag '" + apiTag + "' not found");
+            return null;
+        }
+
+        String versionTagSysId = tagManager.findTagByName(versionTag);
+        if (versionTagSysId == null) {
+            log.error("[getChangeRequestSysId] Version tag '" + versionTag + "' not found");
+            return null;
+        }
+
+        // Query label_entry with OR to get all records for both tags
+        String query = "table=change_request^label=" + apiTagSysId + "^ORlabel=" + versionTagSysId;
+        String encodedQuery = ServiceNowClient.encodeQuery(query);
+        
+        String params = "sysparm_query=" + encodedQuery + "&sysparm_fields=table_key,label&sysparm_limit=1000";
+        String json = client.executeGet("/api/now/table/label_entry", params);
+
+        if (!JsonUtils.hasResults(json)) {
+            log.error("[getChangeRequestSysId] No change requests found with tags");
+            return null;
+        }
+
+        // Find change request that has BOTH tags
+        String changeSysId = findChangeRequestWithBothTags(json, apiTagSysId, versionTagSysId);
+        if (changeSysId != null) {
+            log.error("[getChangeRequestSysId] Found change request sys_id: " + changeSysId);
+        }
+        return changeSysId;
+    }
+
+    /**
+     * Checks if a change request exists by directly querying with sys_id.
+     * This is faster than searching by tags when sys_id is already known.
+     * 
+     * @param sysId Change request sys_id
+     * @return true if change request exists, false otherwise
+     */
+    public boolean changeRequestExistsBySysId(String sysId) {
+        log.error("[changeRequestExistsBySysId] Checking if change request exists with sys_id: " + sysId);
+        
+        try {
+            String params = "sysparm_fields=sys_id";
+            String json = client.executeGet("/api/now/table/change_request/" + sysId, params);
+            
+            // If we get a valid response with sys_id, the CR exists
+            String retrievedSysId = JsonUtils.extractFirstField(json, "sys_id");
+            boolean exists = (retrievedSysId != null);
+            
+            log.error("[changeRequestExistsBySysId] Change request exists: " + exists);
+            return exists;
+        } catch (Exception e) {
+            log.error("[changeRequestExistsBySysId] Error checking change request existence for sys_id: " + sysId, e);
+            return false;
+        }
+    }
+
+    /**
+     * Checks authorization status by directly retrieving the change request using sys_id.
+     * Returns both the change request number and authorization status in a single API call.
+     * 
+     * @param sysId Change request sys_id from cache
+     * @return String array [changeRequestNumber, isAuthorized] or null if not found
+     * @throws Exception if retrieval fails
+     */
+    public String[] checkAuthorizationBySysId(String sysId) throws Exception {
+        log.error("[checkAuthorizationBySysId] Checking authorization for sys_id: " + sysId);
+
+        try {
+            // Get both number and state in a single API call
+            String params = "sysparm_fields=number,state";
+            String json = client.executeGet("/api/now/table/change_request/" + sysId, params);
+            
+            String number = JsonUtils.extractFirstField(json, "number");
+            String state = JsonUtils.extractFirstField(json, "state");
+            
+            if (number != null) {
+                boolean isAuthorized = "authorized".equals(state);
+                log.error("[checkAuthorizationBySysId] CR: " + number + ", State: " + state + ", Authorized: " + isAuthorized);
+                return new String[]{number, String.valueOf(isAuthorized)};
+            } else {
+                log.error("[checkAuthorizationBySysId] Change request not found for sys_id: " + sysId);
+                return null;
+            }
+        } catch (Exception e) {
+            log.error("[checkAuthorizationBySysId] Error retrieving change request for sys_id: " + sysId, e);
+            return null;
+        }
+    }
+    
+    /**
+     * Gets the change request number by sys_id (used when retrieving from cache).
+     * 
+     * @param sysId Change request sys_id
+     * @return Change request number or null if not found
+     * @throws Exception if retrieval fails
+     */
+    public String getChangeRequestNumberBySysId(String sysId) throws Exception {
+        log.error("[getChangeRequestNumberBySysId] Retrieving change request number for sys_id: " + sysId);
+
+        try {
+            String params = "sysparm_fields=number";
+            String json = client.executeGet("/api/now/table/change_request/" + sysId, params);
+            
+            String number = JsonUtils.extractFirstField(json, "number");
+            if (number != null) {
+                log.error("[getChangeRequestNumberBySysId] Found change request: " + number);
+            } else {
+                log.error("[getChangeRequestNumberBySysId] Change request not found for sys_id: " + sysId);
+            }
+            return number;
+        } catch (Exception e) {
+            log.error("[getChangeRequestNumberBySysId] Error retrieving change request for sys_id: " + sysId, e);
+            return null;
         }
     }
 

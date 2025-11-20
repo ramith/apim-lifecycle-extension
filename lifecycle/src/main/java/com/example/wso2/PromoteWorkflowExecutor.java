@@ -26,6 +26,9 @@ public class PromoteWorkflowExecutor extends APIStateChangeSimpleWorkflowExecuto
 
     private static final long serialVersionUID = 1L;
     private static final Log log = LogFactory.getLog(PromoteWorkflowExecutor.class);
+    
+    // Properties key for caching ServiceNow change request sys_id
+    private static final String PROPERTY_SERVICENOW_SYS_ID = "servicenow_change_sys_id";
 
     // ServiceNow configuration - initialized from workflow-extensions.xml
     private String serviceNowBaseUrl;
@@ -70,15 +73,19 @@ public class PromoteWorkflowExecutor extends APIStateChangeSimpleWorkflowExecuto
         String apiName = apiStateWorkFlowDTO.getApiName();
         String apiVersion = apiStateWorkFlowDTO.getApiVersion();
         String apiLifeCycleAction = apiStateWorkFlowDTO.getApiLCAction();
+        Object apiMetadata = apiStateWorkFlowDTO.getMetadata();
+        Object apiProperties = apiStateWorkFlowDTO.getProperties();
 
         log.error("[PromoteWorkflowExecutor] Processing workflow - API: '" + apiName + "' v" + apiVersion +
                 ", Current State: '" + currentState + "', LC Action: '" + apiLifeCycleAction + "'");
+        log.error("[PromoteWorkflowExecutor] Metadata: " + apiMetadata.toString());
+        log.error("[PromoteWorkflowExecutor] Properties: " + apiProperties.toString());
 
         try {
             // Handle CREATED state - create change request if needed
             if ("CREATED".equals(currentState)) {
                 log.error("[PromoteWorkflowExecutor] API in CREATED state, checking ServiceNow change request");
-                handleCreatedState(apiName, apiVersion);
+                handleCreatedState(apiStateWorkFlowDTO, apiName, apiVersion);
             }
 
             // Handle Publish/Re-Publish actions - validate approval
@@ -88,7 +95,7 @@ public class PromoteWorkflowExecutor extends APIStateChangeSimpleWorkflowExecuto
                 log.error("[PromoteWorkflowExecutor] Publish action detected, validating ServiceNow approval");
 
                 // handlePublishAction throws WorkflowException if validation fails - this blocks the publish
-                handlePublishAction(apiName, apiVersion, apiLifeCycleAction);
+                handlePublishAction(apiStateWorkFlowDTO, apiName, apiVersion, apiLifeCycleAction);
             }
 
             // All checks passed - approve workflow
@@ -114,13 +121,15 @@ public class PromoteWorkflowExecutor extends APIStateChangeSimpleWorkflowExecuto
     /**
      * Handles publish/re-publish actions by validating ServiceNow change request is authorized.
      * Throws WorkflowException to block the publish if validation fails.
+     * Uses metadata caching to avoid redundant tag searches.
      * 
+     * @param workflowDTO WorkflowDTO containing metadata for caching
      * @param apiName    API name
      * @param apiVersion API version
      * @param lcAction   Lifecycle action (Publish or Re-Publish)
      * @throws WorkflowException if validation fails or change request not found/not authorized
      */
-    private void handlePublishAction(String apiName, String apiVersion, String lcAction) throws WorkflowException {
+    private void handlePublishAction(APIStateWorkflowDTO workflowDTO, String apiName, String apiVersion, String lcAction) throws WorkflowException {
 
         log.error("[handlePublishAction] ----- Starting authorization validation -----");
         log.error("[handlePublishAction] API: '" + apiName + "' v" + apiVersion + ", Action: '" + lcAction + "'");
@@ -131,19 +140,47 @@ public class PromoteWorkflowExecutor extends APIStateChangeSimpleWorkflowExecuto
         log.error("[handlePublishAction] Tags: [" + apiTag + ", " + versionTag + "]");
 
         try {
-            // Step 1: Find change request
-            String changeRequestNumber = changeRequestManager.findChangeRequestNumber(apiTag, versionTag);
-
-            if (changeRequestNumber == null) {
-                String errorMsg = "[handlePublishAction] REJECT: No ServiceNow change request found for API: '" + apiName + "' v" + apiVersion + ". Cannot proceed with " + lcAction + ".";
-                log.error(errorMsg);
-                throw new WorkflowException(errorMsg);
+            // Step 1: Check for cached sys_id in properties
+            String cachedSysId = workflowDTO.getProperties(PROPERTY_SERVICENOW_SYS_ID);
+            if (cachedSysId != null && !cachedSysId.trim().isEmpty()) {
+                log.error("[handlePublishAction] Found cached change request sys_id: " + cachedSysId);
+            } else {
+                log.error("[handlePublishAction] No cached sys_id found in properties");
             }
 
-            log.error("[handlePublishAction] Found change request: " + changeRequestNumber);
+            // Step 2: Check authorization (using cache if available)
+            String changeRequestNumber;
+            boolean isAuthorized;
+            
+            if (cachedSysId != null && !cachedSysId.trim().isEmpty()) {
+                // Use cached sys_id to check authorization directly (1 API call)
+                String[] result = changeRequestManager.checkAuthorizationBySysId(cachedSysId);
+                if (result != null) {
+                    changeRequestNumber = result[0];
+                    isAuthorized = "true".equals(result[1]);
+                    log.error("[handlePublishAction] Retrieved from cache - CR: " + changeRequestNumber + ", Authorized: " + isAuthorized);
+                } else {
+                    log.error("[handlePublishAction] Cached sys_id invalid, falling back to tag search");
+                    changeRequestNumber = changeRequestManager.findChangeRequestNumber(apiTag, versionTag);
+                    if (changeRequestNumber == null) {
+                        String errorMsg = "[handlePublishAction] REJECT: No ServiceNow change request found for API: '" + apiName + "' v" + apiVersion + ". Cannot proceed with " + lcAction + ".";
+                        log.error(errorMsg);
+                        throw new WorkflowException(errorMsg);
+                    }
+                    isAuthorized = changeRequestManager.isChangeRequestAuthorized(apiTag, versionTag);
+                }
+            } else {
+                // No cache - search by tags and check authorization
+                changeRequestNumber = changeRequestManager.findChangeRequestNumber(apiTag, versionTag);
+                if (changeRequestNumber == null) {
+                    String errorMsg = "[handlePublishAction] REJECT: No ServiceNow change request found for API: '" + apiName + "' v" + apiVersion + ". Cannot proceed with " + lcAction + ".";
+                    log.error(errorMsg);
+                    throw new WorkflowException(errorMsg);
+                }
+                isAuthorized = changeRequestManager.isChangeRequestAuthorized(apiTag, versionTag);
+            }
 
-            // Step 2: Check if change request is in authorized state
-            boolean isAuthorized = changeRequestManager.isChangeRequestAuthorized(apiTag, versionTag);
+            // Step 3: Validate authorization status
 
             if (!isAuthorized) {
                 String errorMsg = "[handlePublishAction] REJECT: Change request '" + changeRequestNumber
@@ -173,12 +210,14 @@ public class PromoteWorkflowExecutor extends APIStateChangeSimpleWorkflowExecuto
 
     /**
      * Handles CREATED state by creating a ServiceNow change request if one doesn't exist.
+     * Caches the change request sys_id in workflow metadata for future use.
      * 
+     * @param workflowDTO WorkflowDTO to store metadata
      * @param apiName    API name
      * @param apiVersion API version
      * @throws WorkflowException if operation fails
      */
-    private void handleCreatedState(String apiName, String apiVersion) throws WorkflowException {
+    private void handleCreatedState(APIStateWorkflowDTO workflowDTO, String apiName, String apiVersion) throws WorkflowException {
 
         log.error("[handleCreatedState] ----- Checking for existing change request -----");
         log.error("[handleCreatedState] API: '" + apiName + "' v" + apiVersion);
@@ -187,16 +226,18 @@ public class PromoteWorkflowExecutor extends APIStateChangeSimpleWorkflowExecuto
         String versionTag = "version:" + apiVersion;
 
         try {
-            boolean changeRequestExists = changeRequestManager.changeRequestExists(apiTag, versionTag);
-
-            if (!changeRequestExists) {
-                log.error("[handleCreatedState] No existing change request found - creating new one");
-                changeRequestManager.createChangeRequestWithTags(apiName, apiVersion, apiTag, versionTag);
-            } else {
-                log.error("[handleCreatedState] Change request already exists - skipping creation");
+            // Check if sys_id is already cached and valid
+            String cachedSysId = workflowDTO.getProperties(PROPERTY_SERVICENOW_SYS_ID);
+            if (cachedSysId != null && !cachedSysId.trim().isEmpty() 
+                    && changeRequestManager.changeRequestExistsBySysId(cachedSysId)) {
+                log.error("[handleCreatedState] Cached change request verified: " + cachedSysId);
+                return;
             }
 
-            log.error("[handleCreatedState] ----- CREATED state handling complete -----");
+            // Create new change request and cache it
+            String changeSysId = changeRequestManager.createChangeRequestWithTags(apiName, apiVersion, apiTag, versionTag);
+            workflowDTO.setProperties(PROPERTY_SERVICENOW_SYS_ID, changeSysId);
+            log.error("[handleCreatedState] Created and cached change request: " + changeSysId);
 
         } catch (Exception e) {
             String errorMsg = "[handleCreatedState] Error handling CREATED state for API: '" + apiName + "' v" + apiVersion;
