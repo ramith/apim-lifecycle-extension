@@ -45,6 +45,19 @@ public class ServiceNowChangeRequestManager {
     /**
      * Creates a ServiceNow change request with tags for API name and version.
      * 
+     * <p><b>ServiceNow Tagging Mechanism:</b></p>
+     * <p>ServiceNow uses the <code>label_entry</code> junction table to link tags (labels) to records.
+     * The UI automatically displays tags from label_entry records in the Tags column.</p>
+     * 
+     * <p><b>Process:</b></p>
+     * <ol>
+     *   <li>Create change request record</li>
+     *   <li>Create or reuse tag records in the label table</li>
+     *   <li>Create label_entry records linking tags to the change request</li>
+     * </ol>
+     * 
+     * <p><b>Result:</b> Tags appear in both GUI (Tags column) and are searchable via sys_tags reference field.</p>
+     * 
      * @param apiName API name
      * @param apiVersion API version
      * @param apiTag Tag for API name (e.g., "api:PetStore")
@@ -59,20 +72,25 @@ public class ServiceNowChangeRequestManager {
         // Step 1: Create the change request
         String changeSysId = createChangeRequest(apiName, apiVersion);
         log.error("[createChangeRequestWithTags] Created change request with sys_id: " + changeSysId);
-        // Step 2: Create or reuse tags and attach them
-        String[] tags = {apiTag, versionTag};
-        for (String tagName : tags) {
+        
+        // Step 2: Create or reuse tags and attach them via label_entry
+        String[] tagNames = {apiTag, versionTag};
+        
+        for (String tagName : tagNames) {
             String tagSysId = tagManager.getOrCreateTag(tagName);
             log.error("[createChangeRequestWithTags] Tag '" + tagName + "' sys_id: " + tagSysId);
-
+            
+            // Create label_entry record - this makes tags visible in UI and searchable via API
             tagManager.attachTagToChange(tagSysId, changeSysId);
-            log.error("[createChangeRequestWithTags] Attached tag '" + tagName + "' to change request");
+            log.error("[createChangeRequestWithTags] Attached tag '" + tagName + "' via label_entry");
         }
+        
+        log.error("[createChangeRequestWithTags] All tags attached - tags should now be visible in ServiceNow UI");
     }
 
     /**
      * Gets the change request number for the given API by searching with tags.
-     * Uses sys_tags reference field for efficient searching with both tags.
+     * Uses a single ServiceNow query with OR operator to find change requests with BOTH tags.
      * 
      * @param apiTag API tag (e.g., "api:PetStore")
      * @param versionTag Version tag (e.g., "version:1.0.0")
@@ -95,23 +113,102 @@ public class ServiceNowChangeRequestManager {
             return null;
         }
 
-        // Step 2: Search change_request using sys_tags with both tags (AND logic)
-        String query = tagManager.buildTagQuery(apiTagSysId, versionTagSysId);
+        // Step 2: Single query with OR to get all label_entry records for both tags
+        // Query: table=change_request^label=<apiTagSysId>^ORlabel=<versionTagSysId>
+        String query = "table=change_request^label=" + apiTagSysId + "^ORlabel=" + versionTagSysId;
         String encodedQuery = ServiceNowClient.encodeQuery(query);
         
         log.error("[findChangeRequestNumber] Query: " + query);
 
-        String params = "sysparm_query=" + encodedQuery + "&sysparm_fields=sys_id,number&sysparm_limit=1";
-        String json = client.executeGet("/api/now/table/change_request", params);
+        String params = "sysparm_query=" + encodedQuery + "&sysparm_fields=table_key,label&sysparm_limit=1000";
+        String json = client.executeGet("/api/now/table/label_entry", params);
 
         if (!JsonUtils.hasResults(json)) {
+            log.error("[findChangeRequestNumber] No change requests found with tags");
+            return null;
+        }
+
+        // Step 3: Find change request that has BOTH tags
+        String changeSysId = findChangeRequestWithBothTags(json, apiTagSysId, versionTagSysId);
+        if (changeSysId == null) {
             log.error("[findChangeRequestNumber] No change request found with both tags");
             return null;
         }
 
-        String number = JsonUtils.extractFirstField(json, "number");
-        log.error("[findChangeRequestNumber] Found change request: " + number);
+        // Step 4: Get the change request number
+        String params2 = "sysparm_fields=number";
+        String json2 = client.executeGet("/api/now/table/change_request/" + changeSysId, params2);
+        
+        String number = JsonUtils.extractFirstField(json2, "number");
+        log.error("[findChangeRequestNumber] Found change request: " + number + " (sys_id: " + changeSysId + ")");
         return number;
+    }
+
+    /**
+     * Finds a change request that has both required tags from a single OR query result.
+     * Builds a map of table_key -> labels and finds the one with both tag sys_ids.
+     * 
+     * @param json Label_entry query results
+     * @param apiTagSysId API tag sys_id
+     * @param versionTagSysId Version tag sys_id
+     * @return Change request sys_id or null if no match
+     */
+    private String findChangeRequestWithBothTags(String json, String apiTagSysId, String versionTagSysId) {
+        // Build map: table_key -> Set<label_sys_id>
+        java.util.Map<String, java.util.Set<String>> changeRequestTags = new java.util.HashMap<>();
+        
+        try {
+            int startIndex = 0;
+            while (true) {
+                // Find the start of a result object
+                int objectStart = json.indexOf("{", startIndex);
+                if (objectStart == -1) break;
+                
+                // Find the end of this object
+                int objectEnd = json.indexOf("}", objectStart);
+                if (objectEnd == -1) break;
+                
+                String object = json.substring(objectStart, objectEnd + 1);
+                
+                // Extract table_key
+                int tableKeyIndex = object.indexOf("\"table_key\":\"");
+                if (tableKeyIndex == -1) {
+                    startIndex = objectEnd + 1;
+                    continue;
+                }
+                int tableKeyStart = tableKeyIndex + "\"table_key\":\"".length();
+                int tableKeyEnd = object.indexOf("\"", tableKeyStart);
+                String tableKey = object.substring(tableKeyStart, tableKeyEnd);
+                
+                // Extract label
+                int labelIndex = object.indexOf("\"label\":\"");
+                if (labelIndex == -1) {
+                    startIndex = objectEnd + 1;
+                    continue;
+                }
+                int labelStart = labelIndex + "\"label\":\"".length();
+                int labelEnd = object.indexOf("\"", labelStart);
+                String label = object.substring(labelStart, labelEnd);
+                
+                // Add to map
+                changeRequestTags.computeIfAbsent(tableKey, k -> new java.util.HashSet<>()).add(label);
+                
+                startIndex = objectEnd + 1;
+            }
+        } catch (Exception e) {
+            log.error("[findChangeRequestWithBothTags] Error parsing JSON", e);
+            return null;
+        }
+        
+        // Find change request with both tags
+        for (java.util.Map.Entry<String, java.util.Set<String>> entry : changeRequestTags.entrySet()) {
+            if (entry.getValue().contains(apiTagSysId) && entry.getValue().contains(versionTagSysId)) {
+                log.error("[findChangeRequestWithBothTags] Found change request: " + entry.getKey());
+                return entry.getKey();
+            }
+        }
+        
+        return null;
     }
 
     /**

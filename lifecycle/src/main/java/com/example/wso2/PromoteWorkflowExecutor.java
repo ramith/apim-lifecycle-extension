@@ -87,16 +87,8 @@ public class PromoteWorkflowExecutor extends APIStateChangeSimpleWorkflowExecuto
                             || "Re-Publish".equalsIgnoreCase(apiLifeCycleAction.trim()))) {
                 log.error("[PromoteWorkflowExecutor] Publish action detected, validating ServiceNow approval");
 
-                boolean isApproved = handlePublishAction(apiName, apiVersion, apiLifeCycleAction);
-
-                if (!isApproved) {
-                    log.error("[PromoteWorkflowExecutor] *** WORKFLOW REJECTED *** - No approval for API: '" + apiName
-                            + "' v" + apiVersion);
-                    workflowDTO.setStatus(WorkflowStatus.REJECTED);
-                    WorkflowResponse response = complete(workflowDTO);
-                    log.error("[PromoteWorkflowExecutor] ===== Exiting execute() with REJECTED status =====");
-                    return response;
-                }
+                // handlePublishAction throws WorkflowException if validation fails - this blocks the publish
+                handlePublishAction(apiName, apiVersion, apiLifeCycleAction);
             }
 
             // All checks passed - approve workflow
@@ -121,14 +113,14 @@ public class PromoteWorkflowExecutor extends APIStateChangeSimpleWorkflowExecuto
 
     /**
      * Handles publish/re-publish actions by validating ServiceNow change request is authorized.
+     * Throws WorkflowException to block the publish if validation fails.
      * 
      * @param apiName    API name
      * @param apiVersion API version
      * @param lcAction   Lifecycle action (Publish or Re-Publish)
-     * @return true if authorized, false otherwise
-     * @throws WorkflowException if validation fails
+     * @throws WorkflowException if validation fails or change request not found/not authorized
      */
-    private boolean handlePublishAction(String apiName, String apiVersion, String lcAction) throws WorkflowException {
+    private void handlePublishAction(String apiName, String apiVersion, String lcAction) throws WorkflowException {
 
         log.error("[handlePublishAction] ----- Starting authorization validation -----");
         log.error("[handlePublishAction] API: '" + apiName + "' v" + apiVersion + ", Action: '" + lcAction + "'");
@@ -143,9 +135,9 @@ public class PromoteWorkflowExecutor extends APIStateChangeSimpleWorkflowExecuto
             String changeRequestNumber = changeRequestManager.findChangeRequestNumber(apiTag, versionTag);
 
             if (changeRequestNumber == null) {
-                log.error("[handlePublishAction] FAIL: No change request found for API: '" + apiName + "' v" + apiVersion);
-                log.error("[handlePublishAction] Cannot proceed with " + lcAction + " - change request must exist");
-                return false;
+                String errorMsg = "[handlePublishAction] REJECT: No ServiceNow change request found for API: '" + apiName + "' v" + apiVersion + ". Cannot proceed with " + lcAction + ".";
+                log.error(errorMsg);
+                throw new WorkflowException(errorMsg);
             }
 
             log.error("[handlePublishAction] Found change request: " + changeRequestNumber);
@@ -154,21 +146,24 @@ public class PromoteWorkflowExecutor extends APIStateChangeSimpleWorkflowExecuto
             boolean isAuthorized = changeRequestManager.isChangeRequestAuthorized(apiTag, versionTag);
 
             if (!isAuthorized) {
-                log.error("[handlePublishAction] FAIL: Change request " + changeRequestNumber + " is NOT in authorized state");
-                log.error("[handlePublishAction] Rejecting " + lcAction + " action for API: '" + apiName + "' v" + apiVersion);
+                String errorMsg = "[handlePublishAction] REJECT: Change request '" + changeRequestNumber
+                        + "' is NOT in authorized state for API: '" + apiName + "' v" + apiVersion
+                        + ". Cannot proceed with " + lcAction + " - change request must be in an approved state.";
+                log.error(errorMsg);
 
-                // Step 3: Log unauthorized attempt
+                // Log unauthorized attempt
                 changeRequestManager.addUnauthorizedAttemptComment(changeRequestNumber, apiName, apiVersion, lcAction);
 
-                return false;
+                throw new WorkflowException(errorMsg);
             }
 
-            log.error("[handlePublishAction] SUCCESS: Change request " + changeRequestNumber + " is in AUTHORIZED state");
-            log.error("[handlePublishAction] Proceeding with " + lcAction + " for API: '" + apiName + "' v" + apiVersion);
+            log.error("[handlePublishAction] SUCCESS: Change request '" + changeRequestNumber
+                    + "' is authorized for API: '" + apiName + "' v" + apiVersion);
             log.error("[handlePublishAction] ----- Authorization validation complete -----");
 
-            return true;
-
+        } catch (WorkflowException we) {
+            // Re-throw WorkflowException to block the publish
+            throw we;
         } catch (Exception e) {
             String errorMsg = "[handlePublishAction] Error during authorization validation for API: '" + apiName + "' v" + apiVersion;
             log.error(errorMsg, e);
