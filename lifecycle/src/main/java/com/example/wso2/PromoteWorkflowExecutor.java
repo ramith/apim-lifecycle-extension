@@ -11,7 +11,7 @@ import org.wso2.carbon.apimgt.impl.workflow.WorkflowStatus;
 
 import com.example.wso2.servicenow.ServiceNowChangeRequestManager;
 import com.example.wso2.servicenow.ServiceNowClient;
-import com.example.wso2.servicenow.ServiceNowTagManager;
+import com.example.wso2.mapping.MappingServiceClient;
 
 /**
  * Workflow executor for API state changes with ServiceNow integration.
@@ -19,37 +19,35 @@ import com.example.wso2.servicenow.ServiceNowTagManager;
  * 
  * This class orchestrates the workflow by delegating to specialized service classes:
  * - ServiceNowClient: HTTP communication with ServiceNow API
- * - ServiceNowTagManager: Tag/label operations
  * - ServiceNowChangeRequestManager: Change request operations
+ * - MappingServiceClient: API-to-ChangeRequest mapping persistence
  */
 public class PromoteWorkflowExecutor extends APIStateChangeSimpleWorkflowExecutor {
 
     private static final long serialVersionUID = 1L;
     private static final Log log = LogFactory.getLog(PromoteWorkflowExecutor.class);
-    
-    // Properties key for caching ServiceNow change request sys_id
-    private static final String PROPERTY_SERVICENOW_SYS_ID = "servicenow_change_sys_id";
 
     // ServiceNow configuration - initialized from workflow-extensions.xml
     private String serviceNowBaseUrl;
     private String serviceNowUserName;
     private String serviceNowPassword;
-    private String stateList;
+    private String mappingServiceUrl;
+    private String mappingServiceApiKey;
 
-    // ServiceNow service components
+    // Service components
     private ServiceNowClient serviceNowClient;
-    private ServiceNowTagManager tagManager;
     private ServiceNowChangeRequestManager changeRequestManager;
+    private MappingServiceClient mappingServiceClient;
 
     /**
-     * Initializes ServiceNow service components.
+     * Initializes service components.
      * Called lazily on first use to ensure configuration is loaded.
      */
     private void initializeServices() {
         if (serviceNowClient == null) {
             serviceNowClient = new ServiceNowClient(serviceNowBaseUrl, serviceNowUserName, serviceNowPassword);
-            tagManager = new ServiceNowTagManager(serviceNowClient);
-            changeRequestManager = new ServiceNowChangeRequestManager(serviceNowClient, tagManager);
+            changeRequestManager = new ServiceNowChangeRequestManager(serviceNowClient);
+            mappingServiceClient = new MappingServiceClient(mappingServiceUrl, mappingServiceApiKey);
         }
     }
 
@@ -73,19 +71,16 @@ public class PromoteWorkflowExecutor extends APIStateChangeSimpleWorkflowExecuto
         String apiName = apiStateWorkFlowDTO.getApiName();
         String apiVersion = apiStateWorkFlowDTO.getApiVersion();
         String apiLifeCycleAction = apiStateWorkFlowDTO.getApiLCAction();
-        Object apiMetadata = apiStateWorkFlowDTO.getMetadata();
-        Object apiProperties = apiStateWorkFlowDTO.getProperties();
+        String apiId = apiStateWorkFlowDTO.getApiUUID();
 
         log.error("[PromoteWorkflowExecutor] Processing workflow - API: '" + apiName + "' v" + apiVersion +
-                ", Current State: '" + currentState + "', LC Action: '" + apiLifeCycleAction + "'");
-        log.error("[PromoteWorkflowExecutor] Metadata: " + apiMetadata.toString());
-        log.error("[PromoteWorkflowExecutor] Properties: " + apiProperties.toString());
+                " (ID: " + apiId + "), Current State: '" + currentState + "', LC Action: '" + apiLifeCycleAction + "'");
 
         try {
             // Handle CREATED state - create change request if needed
             if ("CREATED".equals(currentState)) {
-                log.error("[PromoteWorkflowExecutor] API in CREATED state, checking ServiceNow change request");
-                handleCreatedState(apiStateWorkFlowDTO, apiName, apiVersion);
+                log.error("[PromoteWorkflowExecutor] API in CREATED state, creating ServiceNow change request");
+                handleCreatedState(apiId, apiName, apiVersion);
             }
 
             // Handle Publish/Re-Publish actions - validate approval
@@ -95,7 +90,7 @@ public class PromoteWorkflowExecutor extends APIStateChangeSimpleWorkflowExecuto
                 log.error("[PromoteWorkflowExecutor] Publish action detected, validating ServiceNow approval");
 
                 // handlePublishAction throws WorkflowException if validation fails - this blocks the publish
-                handlePublishAction(apiStateWorkFlowDTO, apiName, apiVersion, apiLifeCycleAction);
+                handlePublishAction(apiId, apiName, apiVersion, apiLifeCycleAction);
             }
 
             // All checks passed - approve workflow
@@ -120,77 +115,56 @@ public class PromoteWorkflowExecutor extends APIStateChangeSimpleWorkflowExecuto
 
     /**
      * Handles publish/re-publish actions by validating ServiceNow change request is authorized.
+     * Uses mapping service to find the change request sys_id.
      * Throws WorkflowException to block the publish if validation fails.
-     * Uses metadata caching to avoid redundant tag searches.
      * 
-     * @param workflowDTO WorkflowDTO containing metadata for caching
+     * @param apiId      API UUID
      * @param apiName    API name
      * @param apiVersion API version
      * @param lcAction   Lifecycle action (Publish or Re-Publish)
      * @throws WorkflowException if validation fails or change request not found/not authorized
      */
-    private void handlePublishAction(APIStateWorkflowDTO workflowDTO, String apiName, String apiVersion, String lcAction) throws WorkflowException {
+    private void handlePublishAction(String apiId, String apiName, String apiVersion, String lcAction) 
+            throws WorkflowException {
 
         log.error("[handlePublishAction] ----- Starting authorization validation -----");
-        log.error("[handlePublishAction] API: '" + apiName + "' v" + apiVersion + ", Action: '" + lcAction + "'");
-
-        String apiTag = "api:" + apiName;
-        String versionTag = "version:" + apiVersion;
-
-        log.error("[handlePublishAction] Tags: [" + apiTag + ", " + versionTag + "]");
+        log.error("[handlePublishAction] API: '" + apiName + "' v" + apiVersion + " (ID: " + apiId + ")");
 
         try {
-            // Step 1: Check for cached sys_id in properties
-            String cachedSysId = workflowDTO.getProperties(PROPERTY_SERVICENOW_SYS_ID);
-            if (cachedSysId != null && !cachedSysId.trim().isEmpty()) {
-                log.error("[handlePublishAction] Found cached change request sys_id: " + cachedSysId);
-            } else {
-                log.error("[handlePublishAction] No cached sys_id found in properties");
-            }
-
-            // Step 2: Check authorization (using cache if available)
-            String changeRequestNumber;
-            boolean isAuthorized;
+            // Step 1: Get sys_id from mapping service
+            com.example.wso2.mapping.MappingDTO mapping = mappingServiceClient.getMappingByApiId(apiId);
             
-            if (cachedSysId != null && !cachedSysId.trim().isEmpty()) {
-                // Use cached sys_id to check authorization directly (1 API call)
-                String[] result = changeRequestManager.checkAuthorizationBySysId(cachedSysId);
-                if (result != null) {
-                    changeRequestNumber = result[0];
-                    isAuthorized = "true".equals(result[1]);
-                    log.error("[handlePublishAction] Retrieved from cache - CR: " + changeRequestNumber + ", Authorized: " + isAuthorized);
-                } else {
-                    log.error("[handlePublishAction] Cached sys_id invalid, falling back to tag search");
-                    changeRequestNumber = changeRequestManager.findChangeRequestNumber(apiTag, versionTag);
-                    if (changeRequestNumber == null) {
-                        String errorMsg = "[handlePublishAction] REJECT: No ServiceNow change request found for API: '" + apiName + "' v" + apiVersion + ". Cannot proceed with " + lcAction + ".";
-                        log.error(errorMsg);
-                        throw new WorkflowException(errorMsg);
-                    }
-                    isAuthorized = changeRequestManager.isChangeRequestAuthorized(apiTag, versionTag);
-                }
-            } else {
-                // No cache - search by tags and check authorization
-                changeRequestNumber = changeRequestManager.findChangeRequestNumber(apiTag, versionTag);
-                if (changeRequestNumber == null) {
-                    String errorMsg = "[handlePublishAction] REJECT: No ServiceNow change request found for API: '" + apiName + "' v" + apiVersion + ". Cannot proceed with " + lcAction + ".";
-                    log.error(errorMsg);
-                    throw new WorkflowException(errorMsg);
-                }
-                isAuthorized = changeRequestManager.isChangeRequestAuthorized(apiTag, versionTag);
+            if (mapping == null) {
+                String errorMsg = "[handlePublishAction] REJECT: No mapping found for API '" + apiName + "' v" 
+                    + apiVersion + ". Cannot proceed with " + lcAction + ".";
+                log.error(errorMsg);
+                throw new WorkflowException(errorMsg);
             }
 
-            // Step 3: Validate authorization status
+            String sysId = mapping.getSysId();
+            log.error("[handlePublishAction] Found sys_id from mapping: " + sysId);
+
+            // Step 2: Get change request details from ServiceNow
+            org.json.simple.JSONObject crDetails = changeRequestManager.getChangeRequestBySysId(sysId);
+            
+            if (crDetails == null) {
+                String errorMsg = "[handlePublishAction] REJECT: Change request " + sysId 
+                    + " not found in ServiceNow for API '" + apiName + "' v" + apiVersion + ".";
+                log.error(errorMsg);
+                throw new WorkflowException(errorMsg);
+            }
+
+            String changeRequestNumber = (String) crDetails.get("number");
+            String state = (String) crDetails.get("state");
+            
+            // Step 3: Check if change request is in authorized state
+            boolean isAuthorized = changeRequestManager.isStateAuthorized(state);
 
             if (!isAuthorized) {
                 String errorMsg = "[handlePublishAction] REJECT: Change request '" + changeRequestNumber
-                        + "' is NOT in authorized state for API: '" + apiName + "' v" + apiVersion
+                        + "' (state: " + state + ") is NOT in authorized state for API: '" + apiName + "' v" + apiVersion
                         + ". Cannot proceed with " + lcAction + " - change request must be in an approved state.";
                 log.error(errorMsg);
-
-                // Log unauthorized attempt
-                changeRequestManager.addUnauthorizedAttemptComment(changeRequestNumber, apiName, apiVersion, lcAction);
-
                 throw new WorkflowException(errorMsg);
             }
 
@@ -199,51 +173,86 @@ public class PromoteWorkflowExecutor extends APIStateChangeSimpleWorkflowExecuto
             log.error("[handlePublishAction] ----- Authorization validation complete -----");
 
         } catch (WorkflowException we) {
-            // Re-throw WorkflowException to block the publish
             throw we;
         } catch (Exception e) {
-            String errorMsg = "[handlePublishAction] Error during authorization validation for API: '" + apiName + "' v" + apiVersion;
+            String errorMsg = "[handlePublishAction] Error during authorization validation for API: '" + apiName 
+                + "' v" + apiVersion;
             log.error(errorMsg, e);
             throw new WorkflowException(errorMsg, e);
         }
     }
 
     /**
-     * Handles CREATED state by creating a ServiceNow change request if one doesn't exist.
-     * Caches the change request sys_id in workflow metadata for future use.
+     * Handles CREATED state by ensuring ServiceNow change request and mapping exist.
+     * Creates or repairs the CR/mapping relationship as needed.
      * 
-     * @param workflowDTO WorkflowDTO to store metadata
+     * @param apiId      API UUID
      * @param apiName    API name
      * @param apiVersion API version
      * @throws WorkflowException if operation fails
      */
-    private void handleCreatedState(APIStateWorkflowDTO workflowDTO, String apiName, String apiVersion) throws WorkflowException {
+    private void handleCreatedState(String apiId, String apiName, String apiVersion) throws WorkflowException {
 
-        log.error("[handleCreatedState] ----- Checking for existing change request -----");
-        log.error("[handleCreatedState] API: '" + apiName + "' v" + apiVersion);
-
-        String apiTag = "api:" + apiName;
-        String versionTag = "version:" + apiVersion;
+        log.error("[handleCreatedState] Processing API: '" + apiName + "' v" + apiVersion + " (ID: " + apiId + ")");
 
         try {
-            // Check if sys_id is already cached and valid
-            String cachedSysId = workflowDTO.getProperties(PROPERTY_SERVICENOW_SYS_ID);
-            if (cachedSysId != null && !cachedSysId.trim().isEmpty() 
-                    && changeRequestManager.changeRequestExistsBySysId(cachedSysId)) {
-                log.error("[handleCreatedState] Cached change request verified: " + cachedSysId);
+            com.example.wso2.mapping.MappingDTO mapping = mappingServiceClient.getMappingByApiId(apiId);
+            
+            if (mapping == null) {
+                // Fresh API - create everything
+                createNewChangeRequestAndMapping(apiId, apiName, apiVersion);
                 return;
             }
 
-            // Create new change request and cache it
-            String changeSysId = changeRequestManager.createChangeRequestWithTags(apiName, apiVersion, apiTag, versionTag);
-            workflowDTO.setProperties(PROPERTY_SERVICENOW_SYS_ID, changeSysId);
-            log.error("[handleCreatedState] Created and cached change request: " + changeSysId);
+            // Mapping exists - verify CR still exists in ServiceNow
+            if (changeRequestExistsInServiceNow(mapping.getSysId())) {
+                log.error("[handleCreatedState] Change request already exists, nothing to do");
+                return;
+            }
+
+            // CR missing - recreate and update mapping
+            repairChangeRequestMapping(apiId, apiName, apiVersion, mapping.getSysId());
 
         } catch (Exception e) {
             String errorMsg = "[handleCreatedState] Error handling CREATED state for API: '" + apiName + "' v" + apiVersion;
             log.error(errorMsg, e);
             throw new WorkflowException(errorMsg, e);
         }
+    }
+
+    /**
+     * Creates new change request in ServiceNow and stores mapping.
+     */
+    private void createNewChangeRequestAndMapping(String apiId, String apiName, String apiVersion) throws Exception {
+        log.error("[handleCreatedState] No mapping found - creating new CR and mapping");
+        
+        String sysId = changeRequestManager.createChangeRequest(apiName, apiVersion);
+        log.error("[handleCreatedState] Created change request: " + sysId);
+        
+        mappingServiceClient.createMapping(sysId, apiId, apiName, apiVersion);
+        log.error("[handleCreatedState] Created mapping");
+    }
+
+    /**
+     * Checks if change request exists in ServiceNow.
+     */
+    private boolean changeRequestExistsInServiceNow(String sysId) throws Exception {
+        log.error("[handleCreatedState] Verifying CR exists: " + sysId);
+        org.json.simple.JSONObject crDetails = changeRequestManager.getChangeRequestBySysId(sysId);
+        return crDetails != null;
+    }
+
+    /**
+     * Recreates missing change request and updates the mapping.
+     */
+    private void repairChangeRequestMapping(String apiId, String apiName, String apiVersion, String oldSysId) throws Exception {
+        log.error("[handleCreatedState] WARNING: CR " + oldSysId + " missing, recreating");
+        
+        String newSysId = changeRequestManager.createChangeRequest(apiName, apiVersion);
+        log.error("[handleCreatedState] Created new change request: " + newSysId);
+        
+        mappingServiceClient.updateMapping(apiId, newSysId, apiName, apiVersion);
+        log.error("[handleCreatedState] Updated mapping with new sys_id");
     }
 
     public String getServiceNowBaseUrl() {
@@ -273,12 +282,19 @@ public class PromoteWorkflowExecutor extends APIStateChangeSimpleWorkflowExecuto
         log.error("[Config] ServiceNow Password configured (hidden)");
     }
 
-    public String getStateList() {
-        return stateList;
+    public String getMappingServiceUrl() {
+        return mappingServiceUrl;
     }
 
-    public void setStateList(String stateList) {
-        this.stateList = stateList;
-        log.error("[Config] State list configured");
+    public void setMappingServiceUrl(String mappingServiceUrl) {
+        this.mappingServiceUrl = mappingServiceUrl;
+    }
+
+    public String getMappingServiceApiKey() {
+        return mappingServiceApiKey;
+    }
+
+    public void setMappingServiceApiKey(String mappingServiceApiKey) {
+        this.mappingServiceApiKey = mappingServiceApiKey;
     }
 }
